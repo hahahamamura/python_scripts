@@ -1,176 +1,218 @@
+#!/usr/bin/env python3
+"""
+Script simplificado para executar FreeBayes em todos os BAMs de um diretório,
+usando regiões específicas de um arquivo BED, e concatenar os VCFs com bcftools.
+"""
+
 import os
+import sys
 import subprocess
-from glob import glob
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+import glob
+from pathlib import Path
 
-# Caminhos principais
-base_dir = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel"
-bam_dir = os.path.join(base_dir, "BAMs_RG")
-ref_dir = os.path.join(base_dir, "REF")
-bed_dir = os.path.join(base_dir, "BED")
-output_dir = os.path.join(base_dir, "VCFs_regions")
-temp_bed_dir = os.path.join(base_dir, "temp_beds")
+# ============= CONFIGURAÇÕES - EDITE AQUI =============
+REF_FASTA = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/REF/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/BAMs_INDEX"
+BED_FILE = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/BED/livia.bed"
+OUTPUT_DIR = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/VCF_MERGED"
+KEEP_INTERMEDIATE = False  # True para manter arquivos VCF intermediários
+# =====================================================
 
-# Criar diretórios
-os.makedirs(output_dir, exist_ok=True)
-os.makedirs(temp_bed_dir, exist_ok=True)
-
-# Referência e BED
-reference = glob(os.path.join(ref_dir, "*.fa"))[0]
-bed_file = glob(os.path.join(bed_dir, "*output_fixed.bed"))[0]
-
-# BAMs
-bam_files = glob(os.path.join(bam_dir, "*.bam"))
-bam_list = " ".join(bam_files)
-
-# Lista de VCFs gerados (thread-safe)
-vcf_files = []
-vcf_lock = Lock()
-
-def read_bed_lines(bed_file):
-    """Lê todas as linhas do arquivo BED"""
-    print(f"📋 Lendo arquivo BED: {bed_file}")
-    with open(bed_file, 'r') as f:
-        lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-    print(f"📊 Total de regiões encontradas: {len(lines)}")
-    return lines
-
-def process_bed_region(region_data):
-    """Processa uma região específica do BED"""
-    region_index, bed_line = region_data
+def parse_bed_file(bed_file):
+    """
+    Parse do arquivo BED para extrair regiões no formato chr:start-end
+    """
+    regions = []
+    try:
+        with open(bed_file, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                fields = line.split('\t')
+                if len(fields) < 3:
+                    print(f"Aviso: Linha {line_num} do BED não tem pelo menos 3 campos: {line}")
+                    continue
+                
+                chrom = fields[0]
+                start = fields[1]
+                end = fields[2]
+                
+                # Formato para freebayes: chr:start-end
+                region = f"{chrom}:{start}-{end}"
+                regions.append(region)
     
-    # Criar arquivo BED temporário para esta região
-    temp_bed = os.path.join(temp_bed_dir, f"region_{region_index:06d}.bed")
-    with open(temp_bed, 'w') as f:
-        f.write(bed_line + '\n')
+    except FileNotFoundError:
+        print(f"Erro: Arquivo BED '{bed_file}' não encontrado.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Erro ao ler arquivo BED: {e}")
+        sys.exit(1)
     
-    # Nome do VCF de saída para esta região
-    output_vcf = os.path.join(output_dir, f"region_{region_index:06d}.vcf")
+    return regions
+
+def find_bam_files(bam_directory):
+    """
+    Encontra todos os arquivos BAM em um diretório
+    """
+    bam_pattern = os.path.join(bam_directory, "*.bam")
+    bam_files = glob.glob(bam_pattern)
     
-    # Extrair informações da região para o log
-    parts = bed_line.split('\t')
-    if len(parts) >= 3:
-        chrom, start, end = parts[0], parts[1], parts[2]
-        region_info = f"{chrom}:{start}-{end}"
-    else:
-        region_info = f"região_{region_index}"
+    if not bam_files:
+        print(f"Nenhum arquivo BAM encontrado em: {bam_directory}")
+        sys.exit(1)
     
-    cmd = (
-        f"~/freebayes -f {reference} "
-        f"-t {temp_bed} "
-        f"{bam_list} > {output_vcf}"
-    )
+    return sorted(bam_files)
+
+def run_freebayes(ref_fasta, bam_file, region, output_vcf):
+    """
+    Executa o FreeBayes para um BAM específico e região
+    """
+    cmd = [
+        'freebayes',
+        '-f', ref_fasta,
+        '-r', region,
+        bam_file
+    ]
     
-    print(f"🔄 Processando {region_info} (região {region_index+1})...")
+    print(f"Executando: {' '.join(cmd)} > {output_vcf}")
     
     try:
-        # Executar FreeBayes
-        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        with open(output_vcf, 'w') as outfile:
+            result = subprocess.run(cmd, stdout=outfile, stderr=subprocess.PIPE, 
+                                  text=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Erro ao executar FreeBayes: {e}")
+        print(f"Stderr: {e.stderr}")
+        return False
+    except FileNotFoundError:
+        print("Erro: FreeBayes não encontrado. Certifique-se de que está instalado e no PATH.")
+        return False
+
+def concatenate_with_bcftools(vcf_files, output_vcf):
+    """
+    Concatena múltiplos arquivos VCF usando bcftools concat
+    """
+    print(f"Concatenando {len(vcf_files)} arquivos VCF usando bcftools concat...")
+    
+    # Filtrar apenas arquivos que existem e não estão vazios
+    valid_vcfs = []
+    for vcf in vcf_files:
+        if os.path.exists(vcf) and os.path.getsize(vcf) > 0:
+            valid_vcfs.append(vcf)
+    
+    if not valid_vcfs:
+        print("Nenhum arquivo VCF válido para concatenar")
+        return False
+    
+    cmd = ['bcftools', 'concat'] + valid_vcfs + ['-O', 'v', '-o', output_vcf]
+    
+    try:
+        print(f"Executando: {' '.join(cmd)}")
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, check=True)
+        print(f"Concatenação concluída: {output_vcf}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Erro ao executar bcftools concat: {e}")
+        print(f"Stderr: {e.stderr}")
+        return False
+    except FileNotFoundError:
+        print("Erro: bcftools não encontrado. Certifique-se de que está instalado e no PATH.")
+        return False
+
+def main():
+    # Verificar se arquivos e diretórios existem
+    if not os.path.exists(REF_FASTA):
+        print(f"Erro: Arquivo de referência não encontrado: {REF_FASTA}")
+        sys.exit(1)
+    
+    if not os.path.exists(BAM_DIRECTORY):
+        print(f"Erro: Diretório de BAMs não encontrado: {BAM_DIRECTORY}")
+        sys.exit(1)
+    
+    if not os.path.exists(BED_FILE):
+        print(f"Erro: Arquivo BED não encontrado: {BED_FILE}")
+        sys.exit(1)
+    
+    # Criar diretório de saída
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(exist_ok=True)
+    
+    # Parse do arquivo BED
+    print("Lendo arquivo BED...")
+    regions = parse_bed_file(BED_FILE)
+    print(f"Encontradas {len(regions)} regiões no arquivo BED")
+    
+    # Encontrar arquivos BAM
+    print("Procurando arquivos BAM...")
+    bam_files = find_bam_files(BAM_DIRECTORY)
+    print(f"Encontrados {len(bam_files)} arquivos BAM")
+    
+    # Dicionário para armazenar VCFs por amostra
+    sample_vcf_files = {}
+    
+    # Executar FreeBayes para cada combinação BAM x região
+    total_jobs = len(bam_files) * len(regions)
+    current_job = 0
+    
+    for bam_file in bam_files:
+        bam_name = Path(bam_file).stem
+        sample_vcf_files[bam_name] = []
         
-        # Verificar se o VCF foi gerado e não está vazio
-        if os.path.exists(output_vcf) and os.path.getsize(output_vcf) > 0:
-            with vcf_lock:
-                vcf_files.append(output_vcf)
-            print(f"✅ {region_info} processado com sucesso")
+        for i, region in enumerate(regions):
+            current_job += 1
+            print(f"\nProcessando job {current_job}/{total_jobs}")
+            print(f"BAM: {bam_name}, Região: {region}")
+            
+            # Nome do arquivo VCF de saída
+            region_safe = region.replace(':', '_').replace('-', '_')
+            output_vcf = output_dir / f"{bam_name}_{region_safe}.vcf"
+            
+            # Executar FreeBayes
+            success = run_freebayes(REF_FASTA, bam_file, region, str(output_vcf))
+            
+            if success and output_vcf.exists() and output_vcf.stat().st_size > 0:
+                sample_vcf_files[bam_name].append(str(output_vcf))
+            else:
+                print(f"Aviso: Falha ou arquivo vazio para {output_vcf}")
+    
+    # Concatenar VCFs para cada amostra usando bcftools
+    final_vcfs = []
+    for bam_name, vcf_files in sample_vcf_files.items():
+        if vcf_files:
+            final_vcf = output_dir / f"{bam_name}_merged.vcf"
+            print(f"\nConcatenando {len(vcf_files)} regiões para amostra {bam_name}...")
+            success = concatenate_with_bcftools(vcf_files, str(final_vcf))
+            
+            if success:
+                final_vcfs.append(str(final_vcf))
+                print(f"VCF criado para {bam_name}: {final_vcf}")
+            else:
+                print(f"Erro na concatenação dos VCFs para {bam_name}")
         else:
-            print(f"⚠️ VCF vazio para {region_info}, pulando.")
-            
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Erro ao processar {region_info}: {e}")
-        if e.stderr:
-            print(f"   Erro: {e.stderr}")
+            print(f"Nenhum VCF válido gerado para amostra {bam_name}")
     
-    finally:
-        # Limpar arquivo BED temporário
-        if os.path.exists(temp_bed):
-            os.remove(temp_bed)
-
-def clean_temp_files():
-    """Remove arquivos temporários"""
-    if os.path.exists(temp_bed_dir):
-        for file in glob(os.path.join(temp_bed_dir, "*")):
-            os.remove(file)
-        os.rmdir(temp_bed_dir)
-
-# Ler linhas do BED
-bed_lines = read_bed_lines(bed_file)
-
-if not bed_lines:
-    print("❌ Nenhuma região válida encontrada no arquivo BED!")
-    exit(1)
-
-# Processar regiões em paralelo
-print(f"🚀 Iniciando processamento paralelo de {len(bed_lines)} regiões com 4 threads...")
-
-# Criar lista de tuplas (index, bed_line) para passar para as threads
-region_data = list(enumerate(bed_lines))
-
-try:
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        executor.map(process_bed_region, region_data)
-    
-    print(f"📊 {len(vcf_files)} regiões processadas com sucesso de {len(bed_lines)} total")
-    
-    if not vcf_files:
-        print("❌ Nenhum VCF foi gerado! Verifique os arquivos de entrada e comandos.")
-        clean_temp_files()
-        exit(1)
-    
-    # Ordenar VCFs por nome para manter ordem das regiões
-    vcf_files.sort()
-    
-    # Comprimir e indexar todos os VCFs
-    print("📦 Comprimindo e indexando VCFs...")
-    compressed_vcfs = []
-    
-    for i, vcf_file in enumerate(vcf_files, 1):
-        compressed_vcf = f"{vcf_file}.gz"
+    if final_vcfs:
+        print(f"\nProcesso concluído!")
+        print(f"VCFs finais criados: {len(final_vcfs)}")
+        for vcf in final_vcfs:
+            print(f"  - {vcf}")
         
-        print(f"🗜️ Comprimindo {i}/{len(vcf_files)}: {os.path.basename(vcf_file)}...")
-        try:
-            subprocess.run(f"bgzip -c {vcf_file} > {compressed_vcf}", shell=True, check=True)
-            
-            print(f"📇 Indexando {os.path.basename(compressed_vcf)}...")
-            subprocess.run(f"tabix -p vcf {compressed_vcf}", shell=True, check=True)
-            
-            compressed_vcfs.append(compressed_vcf)
-            
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Erro ao comprimir/indexar {vcf_file}: {e}")
-    
-    if not compressed_vcfs:
-        print("❌ Nenhum VCF foi comprimido com sucesso!")
-        clean_temp_files()
-        exit(1)
-    
-    # Concatenar todos os VCFs comprimidos em um final
-    final_vcf = os.path.join(base_dir, "merged_regions.vcf.gz")
-    compressed_vcf_input = " ".join(compressed_vcfs)
-    
-    print("🧬 Concatenando todos os VCFs comprimidos...")
-    try:
-        subprocess.run(
-            f"bcftools concat --threads 14 --allow-overlaps --remove-duplicates -o {final_vcf} -Oz {compressed_vcf_input}",
-            shell=True,
-            check=True
-        )
-        
-        # Indexar o VCF final
-        print("📇 Indexando VCF final...")
-        subprocess.run(f"tabix -p vcf {final_vcf}", shell=True, check=True)
-        
-        print(f"\n✅ Processo concluído! Arquivo final: {final_vcf}")
-        print(f"📁 Regiões processadas: {len(vcf_files)}/{len(bed_lines)}")
-        print(f"📦 Arquivos comprimidos: {len(compressed_vcfs)}")
-        
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Erro na concatenação final: {e}")
+        if not KEEP_INTERMEDIATE:
+            print("\nRemoção de arquivos intermediários...")
+            for sample_vcfs in sample_vcf_files.values():
+                for vcf_file in sample_vcfs:
+                    try:
+                        os.remove(vcf_file)
+                    except OSError:
+                        pass
+            print("Arquivos intermediários removidos")
+        else:
+            print(f"Arquivos VCF intermediários mantidos em: {output_dir}")
+    else:
+        print("Nenhum arquivo VCF final foi gerado com sucesso")
 
-except KeyboardInterrupt:
-    print("\n⚠️ Processo interrompido pelo usuário")
-    
-finally:
-    # Limpar arquivos temporários
-    clean_temp_files()
-    print("🧹 Arquivos temporários removidos")
+if __name__ == "__main__":
+    main()
