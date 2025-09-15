@@ -10,12 +10,12 @@ import subprocess
 import glob
 from pathlib import Path
 
-# ============= CONFIGURAÇÕES - EDITE AQUI =============
+# ============= CONFIGURAÇÕES PICAS =============
 REF_FASTA = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/REF/GRCh38_full_analysis_set_plus_decoy_hla.fa"
 BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/BAMs_INDEX"
 BED_FILE = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/BED/livia.bed"
 OUTPUT_DIR = "/home/lab/Desktop/arq_joao/testes_freebayes_bams_marcel/VCF_MERGED"
-KEEP_INTERMEDIATE = False  # True para manter arquivos VCF intermediários
+KEEP_INTERMEDIATE = False  # TRUE PRA MANTER ARQ INTERMEDIARIO
 # =====================================================
 
 def parse_bed_file(bed_file):

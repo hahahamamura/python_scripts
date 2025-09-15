@@ -1,8 +1,3 @@
-#!/usr/bin/perl
-# from the hla-mapper workflow, calling SNPs and alleles for HLA genes
-# Erick C. Castelli, erick.castelli@unesp.br
-# version 1.0b
-
 use strict;
 use File::Basename;
 use Getopt::Std;
@@ -26,10 +21,10 @@ my $threads = $opt_t;
 
 # YOU MAY CONFIGURE THE SCRIPT WITH YOUR LOCAL INFO
 
-my $vcf = "/home/lab/Desktop/arq_joao/NativoAmericanas/teste_vcf/resultado_final.vcf";
+my $vcf = "/home/lab/Desktop/arq_joao/NativoAmericanas/vcf/HGDP_51_NATIVO_AMERICANOS_filtred_trimmed_minac_norm.vcf";
 my $ped = "";
-my $bams = "/home/lab/Desktop/arq_joao/NativoAmericanas/teste_bam";
-my $out = "/home/lab/Desktop/arq_joao/NativoAmericanas/teste_whatshap";
+my $bams = "/home/lab/Desktop/arq_joao/NativoAmericanas/bams";
+my $out = "/home/lab/Desktop/arq_joao/NativoAmericanas/whatshap";
 my $reference = "/home/lab/Desktop/arq_joao/NativoAmericanas/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa";
 my $threads = 4;
 
@@ -151,7 +146,7 @@ while (<IN>)
 }
 close (IN);
 undef %used;
-goto joining;
+#goto joining;
 
 
 

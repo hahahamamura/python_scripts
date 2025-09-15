@@ -1,171 +1,62 @@
 #!/usr/bin/env python3
-"""
-Script para executar FreeBayes em paralelo por regiões do arquivo BED
-e concatenar os VCFs resultantes usando bcftools - VERSÃO CORRIGIDA PARA DUPLICATAS.
-"""
 
 import os
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 import tempfile
-import shutil
+import resource
+import math
 
-# =============================================================================
-# CONFIGURAÇÕES - DEFINA OS CAMINHOS AQUI
-# =============================================================================
+# CONFIGURAÇÕES
+##############################################################################################
+BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/NativoAmericanas/bams" #Diretório dos bams
+REFERENCE_GENOME = "/home/lab/Desktop/arq_joao/NativoAmericanas/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa" #Genoma de referencia
+BED_FILE = "/home/lab/Desktop/arq_joao/NativoAmericanas/optimized.bed" #Arquivo .bed
+OUTPUT_DIR = "/home/lab/Desktop/arq_joao/NativoAmericanas/vcf" #Diretório de saida dos vcfs
+FINAL_VCF = "HGDP_51_NATIVO_AMERICANOS.vcf.gz" #Nome do vcf final
+MAX_PARALLEL_JOBS = 4 #Número de threads
+##############################################################################################
 
-# Caminhos dos arquivos necessários
-BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/NativoAmericanas/teste_bam"           # Arquivo com lista de BAMs
-REFERENCE_GENOME = "/home/lab/Desktop/arq_joao/NativoAmericanas/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"      # Genoma de referência
-BED_FILE = "/home/lab/Desktop/arq_joao/NativoAmericanas/livia.bed"                   # Arquivo BED com regiões
-OUTPUT_DIR = "/home/lab/Desktop/arq_joao/NativoAmericanas/teste_vcf"                      # Diretório de saída
-FINAL_VCF = "resultado_final.vcf.gz"                     # Nome do VCF final
+# Configurações para concatenação
+BATCH_SIZE = 500  # Processar em lotes menores varias vezes pra concatenar
+MAX_OPEN_FILES = 900  # Limite seguro de arquivos abertos
 
-# Configurações de paralelização
-MAX_PARALLEL_JOBS = 4                                    # Número máximo de jobs simultâneos
-
-# Parâmetros adicionais do FreeBayes (opcional)
-FREEBAYES_EXTRA_PARAMS = ""                             # Ex: "--min-mapping-quality 30"
-
-# =============================================================================
-
-def validate_files():
-    """Valida se todos os arquivos necessários existem e cria bamlist temporário."""
-    files_to_check = [REFERENCE_GENOME, BED_FILE]
-    
-    for file_path in files_to_check:
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
-    
-    # Verifica se o diretório de BAMs existe
-    if not os.path.exists(BAM_DIRECTORY):
-        raise FileNotFoundError(f"Diretório de BAMs não encontrado: {BAM_DIRECTORY}")
-    
-    # Cria diretório de saída se não existir
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-def validate_bam_files(bam_files):
-    """Valida se os arquivos BAM existem e têm índices."""
-    valid_bams = []
-    
-    for bam_file in bam_files:
-        # Verifica se o arquivo BAM existe
-        if not os.path.exists(bam_file):
-            print(f"Aviso: Arquivo BAM não existe: {bam_file}")
-            continue
-        
-        # Verifica se há índice (.bai ou .bam.bai)
-        index_files = [bam_file + ".bai", bam_file.replace(".bam", ".bai")]
-        has_index = any(os.path.exists(idx) for idx in index_files)
-        
-        if not has_index:
-            print(f"Aviso: Arquivo BAM sem índice: {bam_file}")
-            # Tenta criar índice
-            try:
-                print(f"Tentando criar índice para {os.path.basename(bam_file)}...")
-                subprocess.run(["samtools", "index", bam_file], check=True, 
-                             capture_output=True, text=True)
-                print(f"✓ Índice criado para {os.path.basename(bam_file)}")
-            except subprocess.CalledProcessError as e:
-                print(f"✗ Erro ao criar índice para {bam_file}: {e.stderr}")
-                continue
-        
-        # Verifica se o BAM tem reads
-        try:
-            result = subprocess.run(
-                ["samtools", "view", "-c", bam_file],
-                capture_output=True, text=True, check=True
-            )
-            read_count = int(result.stdout.strip())
-            if read_count == 0:
-                print(f"Aviso: Arquivo BAM vazio: {bam_file}")
-            else:
-                print(f"✓ BAM válido: {os.path.basename(bam_file)} ({read_count:,} reads)")
-        except Exception as e:
-            print(f"Aviso: Não foi possível contar reads em {bam_file}: {e}")
-        
-        valid_bams.append(bam_file)
-    
-    return valid_bams
+def increase_file_limits():
+    """Aumenta os limites de arquivos abertos quando possível."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # Tenta aumentar para o máximo permitido
+        new_soft = min(hard, 8192)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+        print(f"Limite de arquivos aumentado para: {new_soft}")
+        return new_soft
+    except:
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print(f"Mantendo limite atual de arquivos: {soft}")
+        return soft
 
 def create_bamlist():
-    """Cria um arquivo temporário com a lista de BAMs do diretório."""
+    """Cria lista de BAMs do diretório."""
     bam_files = []
-    
-    # Procura por arquivos BAM no diretório
-    bam_extensions = ['.bam']
-    
     for file_name in os.listdir(BAM_DIRECTORY):
-        if any(file_name.lower().endswith(ext) for ext in bam_extensions):
-            full_path = os.path.join(BAM_DIRECTORY, file_name)
-            bam_files.append(full_path)
+        if file_name.lower().endswith('.bam'):
+            bam_files.append(os.path.join(BAM_DIRECTORY, file_name))
     
-    if not bam_files:
-        raise Exception(f"Nenhum arquivo BAM encontrado em: {BAM_DIRECTORY}")
-    
-    # Ordena os arquivos BAM para ordem consistente
     bam_files.sort()
-    
-    # Valida arquivos BAM
-    print("Validando arquivos BAM...")
-    valid_bams = validate_bam_files(bam_files)
-    
-    if not valid_bams:
-        raise Exception("Nenhum arquivo BAM válido encontrado!")
-    
-    # Cria arquivo temporário com lista de BAMs
     bamlist_file = os.path.join(OUTPUT_DIR, "bamlist_temp.txt")
     
     with open(bamlist_file, 'w') as f:
-        for bam_file in valid_bams:
+        for bam_file in bam_files:
             f.write(f"{bam_file}\n")
     
-    print(f"✓ {len(valid_bams)} arquivos BAM válidos encontrados")
-    
+    print(f"Criada lista com {len(bam_files)} arquivos BAM")
     return bamlist_file
 
-def check_overlapping_regions(regions):
-    """Verifica e reporta regiões sobrepostas que podem causar duplicatas."""
-    overlaps = []
-    
-    # Converte regiões para formato comparável
-    parsed_regions = []
-    for region_str, region_id in regions:
-        # Format: chr:start-end
-        chrom, coords = region_str.split(':')
-        start, end = map(int, coords.split('-'))
-        parsed_regions.append((chrom, start, end, region_str, region_id))
-    
-    # Verifica sobreposições
-    for i, (chrom1, start1, end1, region1, id1) in enumerate(parsed_regions):
-        for j, (chrom2, start2, end2, region2, id2) in enumerate(parsed_regions[i+1:], i+1):
-            if chrom1 == chrom2:
-                # Verifica se há sobreposição
-                if not (end1 <= start2 or end2 <= start1):  # Há sobreposição
-                    overlap_start = max(start1, start2)
-                    overlap_end = min(end1, end2)
-                    overlaps.append((region1, region2, f"{chrom1}:{overlap_start}-{overlap_end}"))
-    
-    if overlaps:
-        print(f"\n⚠️  AVISO: {len(overlaps)} sobreposições detectadas entre regiões:")
-        for reg1, reg2, overlap in overlaps:
-            print(f"  {reg1} ↔ {reg2} (sobreposição: {overlap})")
-        print("  Isso pode causar variantes duplicadas no resultado final!")
-        
-        # Pergunta se deve continuar
-        response = input("\nContinuar mesmo assim? (y/N): ").lower()
-        if response not in ['y', 'yes', 's', 'sim']:
-            print("Operação cancelada pelo usuário.")
-            sys.exit(1)
-    
-    return overlaps
 
 def read_bed_regions(bed_file):
-    """Lê o arquivo BED e retorna uma lista de regiões ordenadas."""
+    """Lê regiões do BED."""
     regions = []
-    
     with open(bed_file, 'r') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
@@ -174,95 +65,84 @@ def read_bed_regions(bed_file):
             
             parts = line.split('\t')
             if len(parts) < 3:
-                print(f"Aviso: Linha {line_num} do BED inválida (menos de 3 colunas): {line}")
                 continue
             
-            chrom = parts[0]
-            start = parts[1]
-            end = parts[2]
-            
-            # Valida coordenadas
-            try:
-                start_pos = int(start)
-                end_pos = int(end)
-                if start_pos >= end_pos:
-                    print(f"Aviso: Coordenadas inválidas na linha {line_num}: start >= end")
-                    continue
-            except ValueError:
-                print(f"Aviso: Coordenadas não numéricas na linha {line_num}: {line}")
-                continue
-            
-            # Formato para FreeBayes: chr:start-end
+            chrom, start, end = parts[0], parts[1], parts[2]
             region = f"{chrom}:{start}-{end}"
-            regions.append((region, line_num, chrom, start_pos, end_pos))
+            regions.append((region, line_num))
     
-    # Ordena as regiões por cromossomo e posição
-    def sort_key(item):
-        region, line_num, chrom, start_pos, end_pos = item
-        # Tenta converter cromossomo para número, se falhar mantém como string
-        try:
-            if chrom.startswith('chr'):
-                chrom_num = chrom[3:]
-            else:
-                chrom_num = chrom
-            
-            # Trata cromossomos especiais
-            if chrom_num == 'X':
-                return (23, start_pos)
-            elif chrom_num == 'Y':
-                return (24, start_pos)
-            elif chrom_num == 'M' or chrom_num == 'MT':
-                return (25, start_pos)
-            else:
-                return (int(chrom_num), start_pos)
-        except ValueError:
-            # Se não conseguir converter, ordena alfabeticamente
-            return (1000, chrom, start_pos)
-    
-    regions.sort(key=sort_key)
-    
-    # Retorna apenas região e ID da linha (renumerado para ordem)
-    return [(region, idx+1) for idx, (region, line_num, chrom, start_pos, end_pos) in enumerate(regions)]
+    print(f"Lidas {len(regions)} regiões do arquivo BED")
+    return regions
 
-def check_region_coverage(bamlist_file, region):
-    """Verifica se há reads na região especificada."""
-    try:
-        with open(bamlist_file, 'r') as f:
-            bam_files = [line.strip() for line in f if line.strip()]
+def check_existing_vcfs(regions, output_dir):
+    """Verifica quais VCFs já existem e estão válidos."""
+    existing_vcfs = []
+    missing_regions = []
+    invalid_vcfs = []
+    
+    print("Verificando VCFs existentes...")
+    
+    for region, region_id in regions:
+        vcf_file = os.path.join(output_dir, f"region_{region_id:04d}.vcf.gz")
+        idx_file = vcf_file + ".tbi"
         
-        total_reads = 0
-        for bam_file in bam_files:
-            result = subprocess.run(
-                ["samtools", "view", "-c", bam_file, region],
-                capture_output=True, text=True, check=True
-            )
-            reads = int(result.stdout.strip())
-            total_reads += reads
-        
-        return total_reads
-    except Exception as e:
-        print(f"Aviso: Erro ao verificar cobertura da região {region}: {e}")
-        return -1
+        # Verifica se o arquivo existe e tem tamanho > 0
+        if os.path.exists(vcf_file) and os.path.getsize(vcf_file) > 0:
+            # Verifica se o índice existe
+            if os.path.exists(idx_file):
+                # Testa se o arquivo é válido
+                try:
+                    # Teste rápido: tenta ler o cabeçalho
+                    result = subprocess.run([
+                        "bcftools", "view", "-h", vcf_file
+                    ], capture_output=True, check=True)
+                    
+                    existing_vcfs.append(vcf_file)
+                    
+                except subprocess.CalledProcessError:
+                    print(f"  ⚠️  VCF corrompido: {vcf_file}")
+                    invalid_vcfs.append((vcf_file, idx_file))
+                    missing_regions.append((region, region_id))
+            else:
+                print(f"  ⚠️  Falta índice para: {vcf_file}")
+                # Tenta criar o índice
+                try:
+                    subprocess.run(["bcftools", "index", "-f", "-t", vcf_file], 
+                                  check=True, capture_output=True)
+                    existing_vcfs.append(vcf_file)
+                    print(f"  ✅ Índice criado para: {vcf_file}")
+                except subprocess.CalledProcessError:
+                    print(f"  ❌ Erro ao indexar: {vcf_file}")
+                    invalid_vcfs.append((vcf_file, None))
+                    missing_regions.append((region, region_id))
+        else:
+            missing_regions.append((region, region_id))
+    
+    # Remove arquivos corrompidos
+    for vcf_file, idx_file in invalid_vcfs:
+        try:
+            if os.path.exists(vcf_file):
+                os.remove(vcf_file)
+            if idx_file and os.path.exists(idx_file):
+                os.remove(idx_file)
+            print(f"  🗑️  Removido arquivo corrompido: {vcf_file}")
+        except OSError:
+            print(f"  ⚠️  Não foi possível remover: {vcf_file}")
+    
+    print(f"\nResumo da verificação:")
+    print(f"  VCFs existentes válidos: {len(existing_vcfs)}")
+    print(f"  Regiões que precisam ser processadas: {len(missing_regions)}")
+    print(f"  VCFs corrompidos removidos: {len(invalid_vcfs)}")
+    
+    return existing_vcfs, missing_regions
 
 def run_freebayes_region(args):
-    """Executa FreeBayes para uma região específica."""
-    region, region_id, output_dir, bamlist_file, reference, extra_params = args
+    """Executa FreeBayes para uma região."""
+    region, region_id, output_dir, bamlist_file, reference = args
     
-    # Nome do arquivo VCF para esta região
     vcf_file = os.path.join(output_dir, f"region_{region_id:04d}.vcf.gz")
     vcf_temp = vcf_file.replace('.gz', '')
     
-    print(f"Iniciando FreeBayes para região {region} (ID: {region_id})")
-    
-    # Verifica cobertura da região
-    read_count = check_region_coverage(bamlist_file, region)
-    if read_count == 0:
-        print(f"Aviso: Nenhum read encontrado na região {region}")
-        # Ainda assim tenta executar o FreeBayes
-    elif read_count > 0:
-        print(f"✓ Região {region}: {read_count} reads encontrados")
-    
-    # Comando FreeBayes
     cmd = [
         "freebayes",
         "-L", bamlist_file,
@@ -270,310 +150,278 @@ def run_freebayes_region(args):
         "-r", region
     ]
     
-    # Adiciona parâmetros extras se especificados
-    if extra_params:
-        cmd.extend(extra_params.split())
-    
-    print(f"Comando: {' '.join(cmd)}")
-    
     try:
-        # Executa FreeBayes
+        print(f"  Processando região {region_id}: {region}")
+        
         with open(vcf_temp, 'w') as vcf_out:
-            process = subprocess.run(
-                cmd,
-                stdout=vcf_out,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
+            result = subprocess.run(cmd, stdout=vcf_out, stderr=subprocess.PIPE, check=True)
         
-        # Verifica se o VCF tem conteúdo além do cabeçalho
-        variant_count = 0
-        try:
-            with open(vcf_temp, 'r') as f:
-                for line in f:
-                    if not line.startswith('#') and line.strip():
-                        variant_count += 1
-        except Exception as e:
-            print(f"Erro ao contar variantes em {vcf_temp}: {e}")
+        # Verifica se o arquivo foi criado e não está vazio
+        if not os.path.exists(vcf_temp) or os.path.getsize(vcf_temp) == 0:
+            if os.path.exists(vcf_temp):
+                os.remove(vcf_temp)
+            return None
         
-        print(f"VCF temporário gerado com {variant_count} variantes para região {region}")
-        
-        # Comprime o VCF usando bcftools mesmo se estiver vazio
-        subprocess.run(
-            ["bcftools", "view", "-O", "z", "-o", vcf_file, vcf_temp],
-            check=True, capture_output=True
-        )
-        
-        # Remove VCF descomprimido
+        # Comprime
+        subprocess.run(["bcftools", "view", "-O", "z", "-o", vcf_file, vcf_temp], 
+                      check=True, capture_output=True)
         os.remove(vcf_temp)
         
-        # Indexa o VCF comprimido usando bcftools
-        subprocess.run(
-            ["bcftools", "index", "-f", "-t", vcf_file],
-            check=True, capture_output=True
-        )
+        # Indexa
+        subprocess.run(["bcftools", "index", "-f", "-t", vcf_file], 
+                      check=True, capture_output=True)
         
-        print(f"✓ FreeBayes concluído para região {region} (ID: {region_id}) - {variant_count} variantes")
-        return vcf_file, region, None, variant_count
+        print(f"  ✅ Concluído região {region_id}: {region}")
+        return vcf_file
         
     except subprocess.CalledProcessError as e:
-        error_msg = f"Erro ao executar FreeBayes para região {region}: {e.stderr}"
-        print(f"✗ {error_msg}")
-        # Remove arquivo temporário se existir
+        print(f"  ❌ Erro na região {region} (ID: {region_id}): {e.stderr.decode() if e.stderr else str(e)}")
         if os.path.exists(vcf_temp):
             os.remove(vcf_temp)
-        return None, region, error_msg, 0
+        return None
 
-def concatenate_vcfs(vcf_files, output_file):
-    """Concatena os VCFs usando bcftools concat e remove duplicatas."""
-    print(f"\nConcatenando {len(vcf_files)} arquivos VCF...")
-    
-    # Ordena os arquivos VCF por nome (que corresponde à ordem das regiões)
+def concatenate_vcfs_in_batches(vcf_files, output_file, batch_size=BATCH_SIZE):
+    """Concatena VCFs em lotes menores para evitar limite de arquivos abertos."""
     vcf_files.sort()
+    num_files = len(vcf_files)
+    num_batches = math.ceil(num_files / batch_size)
     
-    # Cria arquivo temporário com lista de VCFs
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
-        for vcf_file in vcf_files:
-            tmp_file.write(f"{vcf_file}\n")
-        vcf_list_file = tmp_file.name
+    print(f"Concatenando {num_files} arquivos VCF em {num_batches} lotes...")
     
-    # Arquivo temporário para VCF concatenado
-    temp_concat = output_file.replace('.vcf.gz', '_concat.vcf.gz')
-    # Arquivo temporário para VCF sem duplicatas
-    temp_no_dup = output_file.replace('.vcf.gz', '_no_dup.vcf.gz')
+    batch_files = []
     
     try:
-        # Primeiro: Concatena os VCFs (permite sobreposições)
-        print("Passo 1: Concatenando VCFs...")
-        cmd_concat = [
-            "bcftools", "concat",
-            "-f", vcf_list_file,
-            "-O", "z",
-            "--allow-overlaps",  # Permite sobreposições
-            "-o", temp_concat
-        ]
+        # Primeira fase: criar lotes intermediários
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, num_files)
+            batch_vcfs = vcf_files[start_idx:end_idx]
+            
+            batch_output = os.path.join(OUTPUT_DIR, f"batch_{batch_num:04d}.vcf.gz")
+            
+            print(f"Processando lote {batch_num + 1}/{num_batches} ({len(batch_vcfs)} arquivos)...")
+            
+            # Cria arquivo de lista para este lote
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
+                for vcf_file in batch_vcfs:
+                    tmp_file.write(f"{vcf_file}\n")
+                batch_list_file = tmp_file.name
+            
+            try:
+                # Concatena este lote
+                subprocess.run([
+                    "bcftools", "concat",
+                    "-f", batch_list_file,
+                    "-O", "z",
+                    "--allow-overlaps",
+                    "--remove-duplicates",
+                    "-o", batch_output
+                ], check=True, capture_output=True)
+                
+                # Indexa o lote
+                subprocess.run(["bcftools", "index", "-f", "-t", batch_output], 
+                              check=True, capture_output=True)
+                
+                batch_files.append(batch_output)
+                
+            finally:
+                os.unlink(batch_list_file)
         
-        print(f"Executando: {' '.join(cmd_concat)}")
-        subprocess.run(cmd_concat, check=True)
+        # Segunda fase: concatenar os lotes
+        if len(batch_files) == 1:
+            # Se só há um lote, apenas renomeia
+            os.rename(batch_files[0], output_file)
+            os.rename(batch_files[0] + ".tbi", output_file + ".tbi")
+        else:
+            print(f"Concatenando {len(batch_files)} lotes finais...")
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as tmp_file:
+                for batch_file in batch_files:
+                    tmp_file.write(f"{batch_file}\n")
+                final_list_file = tmp_file.name
+            
+            try:
+                # Concatenação final
+                subprocess.run([
+                    "bcftools", "concat",
+                    "-f", final_list_file,
+                    "-O", "z",
+                    "--allow-overlaps",
+                    "--remove-duplicates",
+                    "-o", output_file
+                ], check=True, capture_output=True)
+                
+            finally:
+                os.unlink(final_list_file)
         
-        # Segundo: Remove duplicatas usando bcftools norm
-        print("Passo 2: Removendo variantes duplicadas...")
-        cmd_norm = [
+        # Remove duplicatas e normaliza o arquivo final
+        temp_final = output_file.replace('.vcf.gz', '_normalized.vcf.gz')
+        
+        print("Removendo duplicatas e normalizando...")
+        subprocess.run([
             "bcftools", "norm",
-            "-d", "both",  # Remove duplicatas (both = posição e alelo)
+            "-d", "all",  # Remove todas as duplicatas
             "-O", "z",
-            "-o", temp_no_dup,
-            temp_concat
-        ]
+            "-o", temp_final,
+            output_file
+        ], check=True, capture_output=True)
         
-        print(f"Executando: {' '.join(cmd_norm)}")
-        result = subprocess.run(cmd_norm, check=True, capture_output=True, text=True)
+        # Substitui pelo arquivo normalizado
+        os.rename(temp_final, output_file)
         
-        # Mostra estatísticas de duplicatas removidas
-        if result.stderr:
-            for line in result.stderr.split('\n'):
-                if 'duplicate' in line.lower() or 'removed' in line.lower():
-                    print(f"  {line.strip()}")
+        # Indexa o arquivo final
+        subprocess.run(["bcftools", "index", "-f", "-t", output_file], 
+                      check=True, capture_output=True)
         
-        # Remove arquivo temporário concatenado
-        os.remove(temp_concat)
+        print(f"Arquivo final criado: {output_file}")
         
-        # Terceiro: Ordena o VCF final
-        print("Passo 3: Ordenando VCF...")
-        cmd_sort = [
-            "bcftools", "sort",
-            "-O", "z",
-            "-o", output_file,
-            temp_no_dup
-        ]
-        
-        print(f"Executando: {' '.join(cmd_sort)}")
-        subprocess.run(cmd_sort, check=True)
-        
-        # Remove arquivo temporário sem duplicatas
-        os.remove(temp_no_dup)
-        
-        # Quarto: Indexa o VCF final ordenado
-        print("Passo 4: Indexando VCF final...")
-        subprocess.run(["bcftools", "index", "-f", "-t", output_file], check=True)
-        
-        # Conta variantes no arquivo final
-        try:
-            result = subprocess.run(
-                ["bcftools", "view", "-H", output_file],
-                capture_output=True, text=True, check=True
-            )
-            final_variant_count = len([line for line in result.stdout.split('\n') if line.strip()])
-            print(f"✓ VCF final criado: {output_file} ({final_variant_count} variantes únicas)")
-        except:
-            print(f"✓ VCF final criado: {output_file}")
-        
-    except subprocess.CalledProcessError as e:
-        # Remove arquivos temporários em caso de erro
-        for temp_file in [temp_concat, temp_no_dup]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        raise Exception(f"Erro ao processar VCFs: {e}")
     finally:
-        # Remove arquivo temporário da lista
-        os.unlink(vcf_list_file)
+        # Limpa arquivos temporários de lote
+        for batch_file in batch_files:
+            if os.path.exists(batch_file):
+                os.remove(batch_file)
+            if os.path.exists(batch_file + ".tbi"):
+                os.remove(batch_file + ".tbi")
 
-def cleanup_intermediate_files(vcf_files):
-    """Remove arquivos VCF intermediários."""
-    print("\nLimpando arquivos intermediários...")
-    for vcf_file in vcf_files:
+def cleanup_temp_files(successful_vcfs):
+    """Remove arquivos VCF temporários após concatenação."""
+    print("Limpando arquivos temporários...")
+    removed_count = 0
+    for vcf_file in successful_vcfs:
         try:
             if os.path.exists(vcf_file):
                 os.remove(vcf_file)
-            # Remove também o índice (.tbi ou .csi)
-            for ext in [".tbi", ".csi"]:
-                index_file = vcf_file + ext
-                if os.path.exists(index_file):
-                    os.remove(index_file)
-        except Exception as e:
-            print(f"Aviso: Não foi possível remover {vcf_file}: {e}")
-
-def check_dependencies():
-    """Verifica se as ferramentas necessárias estão disponíveis."""
-    tools = ["freebayes", "bcftools", "samtools"]
+                removed_count += 1
+            
+            # Remove índice também
+            idx_file = vcf_file + ".tbi"
+            if os.path.exists(idx_file):
+                os.remove(idx_file)
+        except OSError:
+            pass  # Ignora erros de remoção
     
-    for tool in tools:
-        if shutil.which(tool) is None:
-            raise Exception(f"Ferramenta não encontrada: {tool}")
+    print(f"Removidos {removed_count} arquivos temporários")
+
+def get_vcf_stats(vcf_file):
+    """Obtém estatísticas básicas do VCF final."""
+    try:
+        # Conta variantes
+        result = subprocess.run([
+            "bcftools", "view", "-H", vcf_file, "|", "wc", "-l"
+        ], shell=True, capture_output=True, text=True, check=True)
         
-        # Verifica versão
-        try:
-            result = subprocess.run([tool, "--version"], capture_output=True, text=True)
-            version_info = result.stdout.split('\n')[0] if result.stdout else result.stderr.split('\n')[0]
-            print(f"✓ {tool}: {version_info}")
-        except:
-            print(f"✓ {tool}: disponível")
+        variant_count = result.stdout.strip()
+        
+        # Conta amostras
+        result = subprocess.run([
+            "bcftools", "query", "-l", vcf_file, "|", "wc", "-l"
+        ], shell=True, capture_output=True, text=True, check=True)
+        
+        sample_count = result.stdout.strip()
+        
+        file_size = os.path.getsize(vcf_file) / (1024 * 1024)  # MB
+        
+        print(f"\nEstatísticas do arquivo final:")
+        print(f"  Variantes: {variant_count}")
+        print(f"  Amostras: {sample_count}")
+        print(f"  Tamanho: {file_size:.2f} MB")
+        
+    except subprocess.CalledProcessError:
+        print("Não foi possível obter estatísticas do arquivo final")
 
 def main():
-    """Função principal."""
-    print("=== FreeBayes Paralelo - Versão Anti-Duplicatas ===")
-    print(f"Diretório de BAMs: {BAM_DIRECTORY}")
-    print(f"Genoma de referência: {REFERENCE_GENOME}")
-    print(f"Arquivo BED: {BED_FILE}")
-    print(f"Diretório de saída: {OUTPUT_DIR}")
-    print(f"Jobs paralelos: {MAX_PARALLEL_JOBS}")
-    print()
+    print("=== FreeBayes Parallel - Processamento de Nativos Americanos ===")
     
-    bamlist_file = None
+    # Aumenta limites de arquivos
+    file_limit = increase_file_limits()
     
-    try:
-        # Verifica dependências
-        print("Verificando dependências...")
-        check_dependencies()
+    # Ajusta tamanho do lote baseado no limite de arquivos
+    global BATCH_SIZE
+    BATCH_SIZE = min(BATCH_SIZE, file_limit // 2)
+    print(f"Tamanho do lote ajustado para: {BATCH_SIZE}")
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Lê regiões do BED
+    regions = read_bed_regions(BED_FILE)
+    
+    if not regions:
+        print("Erro: Nenhuma região válida encontrada no arquivo BED!")
+        return
+    
+    # Verifica VCFs existentes
+    existing_vcfs, missing_regions = check_existing_vcfs(regions, OUTPUT_DIR)
+    
+    # Se há regiões faltantes, processa elas
+    newly_created_vcfs = []
+    if missing_regions:
+        print(f"\n🔧 Processando {len(missing_regions)} regiões faltantes com FreeBayes...")
         
-        # Valida arquivos
-        print("Validando arquivos...")
-        validate_files()
-        print("✓ Todos os arquivos estão acessíveis")
-        
-        # Cria lista de BAMs
-        print("Criando lista de arquivos BAM...")
+        # Cria bamlist
         bamlist_file = create_bamlist()
         
-        # Lê regiões do BED
-        print("Lendo regiões do arquivo BED...")
-        regions = read_bed_regions(BED_FILE)
-        print(f"✓ {len(regions)} regiões encontradas")
-        
-        if not regions:
-            print("Nenhuma região válida encontrada no arquivo BED!")
-            return 1
-        
-        # Verifica sobreposições entre regiões
-        print("Verificando sobreposições entre regiões...")
-        overlaps = check_overlapping_regions(regions)
-        if not overlaps:
-            print("✓ Nenhuma sobreposição detectada entre regiões")
-        
-        # Teste com uma região primeiro (opcional)
-        if len(regions) > 1:
-            print(f"\nTestando primeira região: {regions[0][0]}")
-            test_args = (regions[0][0], regions[0][1], OUTPUT_DIR, bamlist_file, 
-                        REFERENCE_GENOME, FREEBAYES_EXTRA_PARAMS)
-            test_result = run_freebayes_region(test_args)
-            if test_result[0] is None:
-                print("Teste falhou! Verifique configurações antes de continuar.")
-                return 1
-            print("✓ Teste bem-sucedido, continuando com todas as regiões...\n")
-        
-        # Prepara argumentos para o pool de processos
-        args_list = [
-            (region, region_id, OUTPUT_DIR, bamlist_file, REFERENCE_GENOME, FREEBAYES_EXTRA_PARAMS)
-            for region, region_id in regions
-        ]
-        
-        # Executa FreeBayes em paralelo
-        print(f"Executando FreeBayes para {len(regions)} regiões com {MAX_PARALLEL_JOBS} jobs paralelos...")
-        
-        successful_vcfs = []
-        failed_regions = []
-        total_variants = 0
-        
-        with ProcessPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as executor:
-            # Submete todos os jobs
-            future_to_region = {
-                executor.submit(run_freebayes_region, args): args[0] 
-                for args in args_list
-            }
+        try:
+            # Prepara argumentos apenas para regiões faltantes
+            args_list = [
+                (region, region_id, OUTPUT_DIR, bamlist_file, REFERENCE_GENOME)
+                for region, region_id in missing_regions
+            ]
             
-            # Coleta resultados conforme completam
-            for future in as_completed(future_to_region):
-                region = future_to_region[future]
-                try:
-                    vcf_file, region_name, error, variant_count = future.result()
-                    if vcf_file:
-                        successful_vcfs.append(vcf_file)
-                        total_variants += variant_count
+            print(f"Iniciando processamento paralelo com {MAX_PARALLEL_JOBS} workers...")
+            
+            # Executa em paralelo
+            failed_count = 0
+            
+            with ProcessPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as executor:
+                results = list(executor.map(run_freebayes_region, args_list))
+                
+                for result in results:
+                    if result is not None:
+                        newly_created_vcfs.append(result)
                     else:
-                        failed_regions.append((region_name, error))
-                except Exception as e:
-                    failed_regions.append((region, str(e)))
+                        failed_count += 1
+            
+            print(f"\nResultados do processamento das regiões faltantes:")
+            print(f"  Sucessos: {len(newly_created_vcfs)}")
+            print(f"  Falhas: {failed_count}")
         
-        # Relatório de execução
-        print(f"\n=== Relatório de Execução ===")
-        print(f"Regiões processadas com sucesso: {len(successful_vcfs)}")
-        print(f"Regiões com falha: {len(failed_regions)}")
-        print(f"Total de variantes encontradas (com possíveis duplicatas): {total_variants}")
-        
-        if failed_regions:
-            print("\nRegiões que falharam:")
-            for region, error in failed_regions:
-                print(f"  - {region}: {error}")
-        
-        if not successful_vcfs:
-            print("Nenhum VCF foi gerado com sucesso!")
-            return 1
-        
-        # Concatena VCFs e remove duplicatas
-        final_vcf_path = os.path.join(OUTPUT_DIR, FINAL_VCF)
-        concatenate_vcfs(successful_vcfs, final_vcf_path)
-        
-        # Limpeza (opcional - descomente se desejar remover arquivos intermediários)
-        # cleanup_intermediate_files(successful_vcfs)
-        
-        print(f"\n✓ Processo concluído!")
-        print(f"VCF final: {final_vcf_path}")
-        print(f"Arquivos VCF intermediários mantidos em: {OUTPUT_DIR}")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"\n✗ Erro: {e}")
-        return 1
-    finally:
-        # Remove arquivo bamlist temporário
-        if bamlist_file and os.path.exists(bamlist_file):
-            try:
+        finally:
+            # Limpa bamlist
+            if os.path.exists(bamlist_file):
                 os.remove(bamlist_file)
-                print(f"Arquivo temporário removido: {bamlist_file}")
-            except:
-                pass
+                print("Arquivo bamlist temporário removido")
+    else:
+        print("✅ Todos os VCFs já existem e são válidos!")
+    
+    # Combina VCFs existentes + novos
+    all_vcfs = existing_vcfs + newly_created_vcfs
+    
+    if all_vcfs:
+        print(f"\n📁 Total de VCFs para concatenação: {len(all_vcfs)}")
+        print(f"  - VCFs já existentes: {len(existing_vcfs)}")
+        print(f"  - VCFs recém-criados: {len(newly_created_vcfs)}")
+        
+        # Concatena todos os VCFs
+        final_vcf_path = os.path.join(OUTPUT_DIR, FINAL_VCF)
+        concatenate_vcfs_in_batches(all_vcfs, final_vcf_path)
+        
+        # Obtém estatísticas
+        get_vcf_stats(final_vcf_path)
+        
+        # Remove apenas os VCFs temporários (não os que já existiam)
+        if newly_created_vcfs:
+            cleanup_temp_files(all_vcfs)  # Remove todos após concatenação
+        
+        print(f"\n✅ Processamento concluído com sucesso!")
+        print(f"Arquivo final: {final_vcf_path}")
+    else:
+        print("\n❌ Erro: Nenhum arquivo VCF válido encontrado!")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⚠️  Processamento interrompido pelo usuário")
+    except Exception as e:
+        print(f"\n❌ Erro inesperado: {str(e)}")
+        raise
