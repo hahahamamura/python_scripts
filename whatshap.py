@@ -146,9 +146,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemplo de uso:
-    python whatshap_script.py -v input.vcf.gz -b /path/to/bam/directory -o output_phased.vcf.gz
-    python whatshap_script.py -v input.vcf.gz -b ./bams/ -o output.vcf.gz -r reference.fasta
-    python whatshap_script.py -v input.vcf.gz -b /data/bams --temp-dir /tmp/whatshap -o output.vcf.gz
+    python whatshap_script.py -v input.vcf.gz -b /path/to/bam/directory -o output.vcf.gz -r reference.fasta
         """
     )
     

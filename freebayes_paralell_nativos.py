@@ -10,10 +10,10 @@ import math
 
 # CONFIGURAÇÕES
 ##############################################################################################
-BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/NativoAmericanas/bams" #Diretório dos bams
+BAM_DIRECTORY = "/home/lab/Desktop/arq_joao/ANCESTRY_PANEL/BAMs" #Diretório dos bams
 REFERENCE_GENOME = "/home/lab/Desktop/arq_joao/NativoAmericanas/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa" #Genoma de referencia
-BED_FILE = "/home/lab/Desktop/arq_joao/NativoAmericanas/optimized.bed" #Arquivo .bed
-OUTPUT_DIR = "/home/lab/Desktop/arq_joao/NativoAmericanas/vcf" #Diretório de saida dos vcfs
+BED_FILE = "/home/lab/Desktop/arq_joao/ANCESTRY_PANEL/reference_panel.bed" #Arquivo .bed
+OUTPUT_DIR = "/home/lab/Desktop/arq_joao/ANCESTRY_PANEL/freebayes" #Diretório de saida dos vcfs
 FINAL_VCF = "HGDP_51_NATIVO_AMERICANOS.vcf.gz" #Nome do vcf final
 MAX_PARALLEL_JOBS = 4 #Número de threads
 ##############################################################################################
@@ -52,7 +52,6 @@ def create_bamlist():
     
     print(f"Criada lista com {len(bam_files)} arquivos BAM")
     return bamlist_file
-
 
 def read_bed_regions(bed_file):
     """Lê regiões do BED."""
