@@ -26,18 +26,16 @@ def check_bcftools():
 
 def filter_vcf(vcf_file, bed_file, output_file):
     """
-    Filtra um arquivo VCF usando um arquivo BED de forma rigorosa
+    Filtra um arquivo VCF usando um arquivo BED
     
     Args:
         vcf_file: Caminho para o arquivo VCF de entrada
         bed_file: Caminho para o arquivo BED com regiões
         output_file: Caminho para o arquivo VCF filtrado
     """
-    # Usar -T (target) ao invés de -R para filtragem mais rigorosa
-    # -T inclui apenas variantes que estão EXATAMENTE nas posições do BED
     cmd = [
         'bcftools', 'view',
-        '-T', bed_file,  # Filtrar APENAS posições exatas do BED
+        '-R', bed_file,  # Filtrar por regiões do BED
         '-O', 'z',       # Output comprimido (vcf.gz)
         '-o', output_file,
         vcf_file
@@ -50,44 +48,24 @@ def filter_vcf(vcf_file, bed_file, output_file):
     subprocess.run(['bcftools', 'index', '-t', output_file], check=True)
 
 
-def merge_vcfs(vcf1, vcf2, output_file, bed_file):
+def merge_vcfs(vcf1, vcf2, output_file):
     """
-    Faz merge de dois arquivos VCF e filtra novamente com o BED
+    Faz merge de dois arquivos VCF
     
     Args:
         vcf1: Primeiro arquivo VCF
         vcf2: Segundo arquivo VCF
         output_file: Arquivo VCF de saída
-        bed_file: Arquivo BED para garantir filtragem final
     """
-    # Arquivo temporário para merge inicial
-    temp_merged = output_file.replace('.vcf.gz', '_temp.vcf.gz')
-    
-    # Fazer merge
     cmd = [
         'bcftools', 'merge',
         '-O', 'z',       # Output comprimido
-        '-o', temp_merged,
+        '-o', output_file,
         vcf1, vcf2
     ]
     
     print(f"  Fazendo merge para {os.path.basename(output_file)}...")
     subprocess.run(cmd, check=True)
-    
-    # Filtrar novamente o resultado do merge com o BED para garantir
-    print(f"  Aplicando filtro final...")
-    cmd_filter = [
-        'bcftools', 'view',
-        '-T', bed_file,  # Filtrar novamente apenas posições do BED
-        '-O', 'z',
-        '-o', output_file,
-        temp_merged
-    ]
-    subprocess.run(cmd_filter, check=True)
-    
-    # Remover arquivo temporário
-    if os.path.exists(temp_merged):
-        os.remove(temp_merged)
     
     # Indexar o arquivo final
     subprocess.run(['bcftools', 'index', '-t', output_file], check=True)
@@ -134,8 +112,8 @@ def process_chromosome(chr_num, dir1, dir2, bed_file, output_dir, temp_dir,
         filter_vcf(vcf1_input, bed_file, vcf1_filtered)
         filter_vcf(vcf2_input, bed_file, vcf2_filtered)
         
-        # Fazer merge e filtrar novamente
-        merge_vcfs(vcf1_filtered, vcf2_filtered, output_file, bed_file)
+        # Fazer merge
+        merge_vcfs(vcf1_filtered, vcf2_filtered, output_file)
         
         print(f"  ✓ Cromossomo {chr_num} concluído!")
         return True
