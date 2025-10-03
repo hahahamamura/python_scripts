@@ -105,7 +105,7 @@ def process_chromosome(chr_num, dir1, dir2, bed_file, output_dir, temp_dir,
     vcf2_filtered = os.path.join(temp_dir, f"chr{chr_num}_dir2_filtered.vcf.gz")
     
     # Arquivo de saída final
-    output_file = os.path.join(output_dir, f"chr{chr_num}_merged.vcf.gz")
+    output_file = os.path.join(output_dir, f"chr{chr_num}.merged.vcf.gz")
     
     try:
         # Filtrar ambos os VCFs
